@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import shlex
 import threading
 from collections.abc import Coroutine
 from concurrent.futures import Future
+from pathlib import PurePosixPath
 from typing import Any, cast
 
 _REMOTE_SPEC_TYPES = frozenset({"s3", "postgres", "cos", "oss", "obs"})
@@ -52,6 +54,55 @@ def adapt_backend_protocol(backend: Any) -> Any:
     wrapped = _LegacyProtocolBackend(backend)
     _patch_s3_list_v1(backend)
     return wrapped
+
+
+def patch_sandbox_path_primitives(backend: Any) -> Any:
+    """Give ``execute``-style sandboxes the path primitives ``BackendWorkspace`` needs.
+
+    ``DockerSandbox`` implements ``mkdir_path`` / ``delete_path`` / ``move_path``
+    on top of ``execute``, but ``OpenSandbox`` (and any future ``execute``-only
+    sandbox) ships without them, so expert workspace init fails with
+    ``BackendOperationNotSupportedError: mkdir is not supported ...``. Patch the
+    missing primitives onto the instance, mirroring the ``DockerSandbox``
+    semantics (sandbox paths are already virtual — no host mapping). The
+    workspace async layer falls back to these sync methods on its own, so no
+    ``a*`` variants are needed.
+    """
+    has_execute = callable(getattr(backend, "execute", None))
+    missing = [
+        name
+        for name in ("mkdir_path", "delete_path", "move_path")
+        if not callable(getattr(backend, name, None))
+    ]
+    if not has_execute or not missing:
+        return backend
+
+    def _mkdir_path(path: str) -> None:
+        result = backend.execute(f"mkdir -p {shlex.quote(path)}")
+        if result.exit_code not in (0, None):
+            raise OSError(result.output or f"mkdir failed for {path!r}")
+
+    def _delete_path(path: str) -> None:
+        result = backend.execute(f"rm -rf {shlex.quote(path)}")
+        if result.exit_code not in (0, None):
+            raise OSError(result.output or f"delete failed for {path!r}")
+
+    def _move_path(src: str, dest: str) -> None:
+        result = backend.execute(
+            f"mkdir -p {shlex.quote(str(PurePosixPath(dest).parent))} && "
+            f"mv {shlex.quote(src)} {shlex.quote(dest)}"
+        )
+        if result.exit_code not in (0, None):
+            raise OSError(result.output or f"move failed for {src!r} -> {dest!r}")
+
+    patched = {
+        "mkdir_path": _mkdir_path,
+        "delete_path": _delete_path,
+        "move_path": _move_path,
+    }
+    for name in missing:
+        setattr(backend, name, patched[name])
+    return backend
 
 
 async def _s3_als_info_v1(backend: Any, path: str) -> list[Any]:

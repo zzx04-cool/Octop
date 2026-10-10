@@ -2839,10 +2839,15 @@ class AgentManager:
             }
         elif self._spec_is_opensandbox(backend):
             ensure_opensandbox_deps(allow_install=True)
-        from octop.infra.backend.compat import adapt_backend_protocol  # noqa: PLC0415
+        from octop.infra.backend.compat import (  # noqa: PLC0415
+            adapt_backend_protocol,
+            patch_sandbox_path_primitives,
+        )
 
         return BackendWorkspace(
-            adapt_backend_protocol(resolve_backend(backend, workspace_dir=workspace_dir)),
+            adapt_backend_protocol(
+                patch_sandbox_path_primitives(resolve_backend(backend, workspace_dir=workspace_dir))
+            ),
             workspace_dir,
             system_files_path=system_files_path_from_config(cfg),
         )

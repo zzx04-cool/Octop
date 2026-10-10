@@ -8,7 +8,41 @@ from types import SimpleNamespace
 import pytest
 from deepagents.backends.protocol import BackendProtocol, ReadResult
 
-from octop.infra.backend.compat import adapt_backend_protocol, is_adapted_backend
+from octop.infra.backend.compat import (
+    adapt_backend_protocol,
+    is_adapted_backend,
+    patch_sandbox_path_primitives,
+)
+
+
+class _FakeExecuteResponse:
+    def __init__(self, exit_code: int = 0, output: str = "") -> None:
+        self.exit_code = exit_code
+        self.output = output
+
+
+class _ExecuteOnlySandbox:
+    """Mirrors ``OpenSandbox``: ``execute`` only, no path primitives."""
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
+    def execute(self, command: str) -> _FakeExecuteResponse:
+        self.commands.append(command)
+        return _FakeExecuteResponse()
+
+
+class _DockerLikeSandbox(_ExecuteOnlySandbox):
+    """Mirrors ``DockerSandbox``: already implements all path primitives."""
+
+    def mkdir_path(self, path: str) -> None:
+        del path
+
+    def delete_path(self, path: str) -> None:
+        del path
+
+    def move_path(self, src: str, dest: str) -> None:
+        del src, dest
 
 
 class _LegacyRemote:
@@ -262,3 +296,42 @@ def test_adapt_run_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapped = compat.adapt_backend_protocol(_Hung())
     with pytest.raises(TimeoutError, match="backend I/O timed out"):
         wrapped.ls("/")
+
+
+def test_patch_sandbox_adds_missing_path_primitives() -> None:
+    backend = _ExecuteOnlySandbox()
+    assert patch_sandbox_path_primitives(backend) is backend
+
+    backend.mkdir_path("/a/b")  # type: ignore[attr-defined]
+    backend.delete_path("/a/b")  # type: ignore[attr-defined]
+    backend.move_path("/a/b", "/c/d")  # type: ignore[attr-defined]
+    assert backend.commands == [
+        "mkdir -p /a/b",
+        "rm -rf /a/b",
+        "mkdir -p /c && mv /a/b /c/d",
+    ]
+
+
+def test_patch_sandbox_raises_on_failed_execute() -> None:
+    class _Failing(_ExecuteOnlySandbox):
+        def execute(self, command: str) -> _FakeExecuteResponse:
+            del command
+            return _FakeExecuteResponse(exit_code=1, output="boom")
+
+    backend = patch_sandbox_path_primitives(_Failing())
+    with pytest.raises(OSError, match="boom"):
+        backend.mkdir_path("/a")  # type: ignore[attr-defined]
+    with pytest.raises(OSError, match="boom"):
+        backend.delete_path("/a")  # type: ignore[attr-defined]
+    with pytest.raises(OSError, match="boom"):
+        backend.move_path("/a", "/b")  # type: ignore[attr-defined]
+
+
+def test_patch_sandbox_skips_existing_primitives_and_non_execute_backends() -> None:
+    docker_like = _DockerLikeSandbox()
+    assert patch_sandbox_path_primitives(docker_like) is docker_like
+    assert docker_like.commands == []
+
+    no_execute = SimpleNamespace()
+    assert patch_sandbox_path_primitives(no_execute) is no_execute
+    assert not hasattr(no_execute, "mkdir_path")
